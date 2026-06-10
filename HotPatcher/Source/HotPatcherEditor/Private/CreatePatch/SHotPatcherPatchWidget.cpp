@@ -417,41 +417,40 @@ FReply SHotPatcherPatchWidget::DoPreviewChunk() const
 		}
 	}
 	
-	FString ShowMsg;
-	for (const auto& Chunk : PatchChunks)
-	{	
-		FChunkAssetDescribe ChunkAssetsDescrible = UFlibPatchParserHelper::CollectFChunkAssetsDescribeByChunk(ExportPatchSetting.Get(), VersionDiffInfo,Chunk, ExportPatchSetting->GetPakTargetPlatforms());
-		ShowMsg.Append(FString::Printf(TEXT("Chunk:%s\n"), *Chunk.ChunkName));
-		auto AppendFilesToMsg = [&ShowMsg](const FString& CategoryName, const TArray<FName>& InFiles)
-		{
-			if (!!InFiles.Num())
-			{
-				ShowMsg.Append(FString::Printf(TEXT("%s:\n"), *CategoryName));
-				for (const auto& File : InFiles)
-				{
-					ShowMsg.Append(FString::Printf(TEXT("\t%s\n"), *File.ToString()));
-				}
-			}
-		};
-		AppendFilesToMsg(TEXT("UE Assets"), ChunkAssetsDescrible.GetAssetsStrings());
-		
-		for(auto Platform:ExportPatchSetting->GetPakTargetPlatforms())
-		{
-			TArray<FName> PlatformExFiles;
-			FString PlatformName = THotPatcherTemplateHelper::GetEnumNameByValue(Platform,false);
-			PlatformExFiles.Append(ChunkAssetsDescrible.GetExternalFileNames(Platform));
-			AppendFilesToMsg(PlatformName, PlatformExFiles);
-		}
-		AppendFilesToMsg(TEXT("Internal Files"), ChunkAssetsDescrible.GetInternalFileNames());
-		ShowMsg.Append(TEXT("\n"));
-	}
-	
-	
-	if (!ShowMsg.IsEmpty())
-	{
-		this->ShowMsg(ShowMsg);
-	}
-	return FReply::Handled();
+    // 异步调用新的预览函数，避免阻塞 UI
+    TSharedPtr<FExportPatchSettings> Settings = ExportPatchSetting;
+    FPatchVersionDiff DiffInfo = VersionDiffInfo;
+    TArray<FChunkInfo> Chunks = PatchChunks;
+    // 只预览第一个目标平台（UI 里可扩展为多平台）
+    // 注意：有些项目的 ETargetPlatform 并不包含具体平台枚举，使用 AllPlatforms 作为安全默认
+    ETargetPlatform Platform = Settings->GetPakTargetPlatforms().Num() ? Settings->GetPakTargetPlatforms()[0] : ETargetPlatform::AllPlatforms;
+
+    FThreadWorker* Worker = new FThreadWorker(TEXT("PreviewChunkWorker"), [this, Settings, DiffInfo, Chunks, Platform]() {
+        const FHotPatcherSettingBase* SettingBase = Settings.Get();
+        TMap<FString, TArray<FString>> PreviewMap = UFlibPatchParserHelper::CollectPreviewChunkPackageKeysByChunks(SettingBase, DiffInfo, Chunks, Platform);
+
+        FString ShowMsg;
+        for (const auto& KV : PreviewMap)
+        {
+            ShowMsg.Append(FString::Printf(TEXT("Chunk:%s Count:%d\n"), *KV.Key, KV.Value.Num()));
+            int32 MaxShow = KV.Value.Num();
+            for (int32 i = 0; i < MaxShow; ++i)
+            {
+                ShowMsg.Append(FString::Printf(TEXT("\t%s\n"), *KV.Value[i]));
+            }
+            ShowMsg.Append(TEXT("\n"));
+        }
+
+        // 在主线程显示
+        AsyncTask(ENamedThreads::GameThread, [this, ShowMsg]() {
+            if (!ShowMsg.IsEmpty())
+            {
+                this->ShowMsg(ShowMsg);
+            }
+        });
+    });
+    Worker->Execute();
+    return FReply::Handled();
 }
 
 bool SHotPatcherPatchWidget::CanPreviewChunk() const

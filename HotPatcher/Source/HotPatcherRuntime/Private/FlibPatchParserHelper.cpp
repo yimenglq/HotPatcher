@@ -998,6 +998,179 @@ FChunkAssetDescribe UFlibPatchParserHelper::CollectFChunkAssetsDescribeByChunk(
 }
 
 
+TMap<FString, TArray<FString>> UFlibPatchParserHelper::CollectPreviewChunkPackageKeysByChunks(
+    const FHotPatcherSettingBase* PatcheSettings,
+    const FPatchVersionDiff& DiffInfo,
+    const TArray<FChunkInfo>& Chunks,
+    ETargetPlatform Platform)
+{
+    SCOPED_NAMED_EVENT_TEXT("CollectPreviewChunkPackageKeysByChunks", FColor::Red);
+
+    TMap<FString, TArray<FString>> Result;
+
+    // 1. prescan: 对每个 chunk 运行 ExportReleaseVersionInfoByChunk 得到它的 Asset 列表
+    // 注意：ExportReleaseVersionInfoByChunk / AssetRegistry 的内存枚举只能在游戏线程执行
+    // 我们在后台线程调用此函数时需要把 prescan 派发到游戏线程执行并等待其完成（保持主处理在后台线程）
+    TArray<TSet<FString>> PrescanPackageSets;
+    PrescanPackageSets.SetNum(Chunks.Num());
+
+    for (int32 i = 0; i < Chunks.Num(); ++i)
+    {
+        const FChunkInfo& Chunk = Chunks[i];
+        if (IsInGameThread())
+        {
+            // 已在游戏线程，直接调用
+            FChunkInfo PrescanChunk = Chunk;
+            PrescanChunk.bAnalysisFilterDependencies = true;
+            const FHotPatcherVersion PrescanVersion = UFlibPatchParserHelper::ExportReleaseVersionInfoByChunk(
+                TEXT(""), TEXT(""), TEXT(""), PrescanChunk, PatcheSettings->IsIncludeHasRefAssetsOnly(), true, PatcheSettings->GetHashCalculator());
+            TArray<FString> PrescanPackages = PrescanVersion.AssetInfo.GetAssetLongPackageNames();
+            for (const auto& Pkg : PrescanPackages)
+            {
+                PrescanPackageSets[i].Add(UFlibAssetManageHelper::PackagePathToLongPackageName(Pkg));
+            }
+        }
+        else
+        {
+            // 非游戏线程：派发到游戏线程并使用同步事件等待结果
+            TSharedPtr<TArray<FString>, ESPMode::ThreadSafe> PrescanPackages = MakeShared<TArray<FString>, ESPMode::ThreadSafe>();
+            FEvent* DoneEvent = FPlatformProcess::GetSynchEventFromPool(true);
+
+            // 捕获需要的值 by value，避免引用悬挂
+            FChunkInfo CapturedChunk = Chunk;
+            const FHotPatcherSettingBase* CapturedSettings = PatcheSettings;
+
+            AsyncTask(ENamedThreads::GameThread, [CapturedChunk, CapturedSettings, PrescanPackages, DoneEvent]() mutable {
+                FChunkInfo PrescanChunk = CapturedChunk;
+                PrescanChunk.bAnalysisFilterDependencies = true;
+                const FHotPatcherVersion PrescanVersion = UFlibPatchParserHelper::ExportReleaseVersionInfoByChunk(
+                    TEXT(""), TEXT(""), TEXT(""), PrescanChunk, CapturedSettings->IsIncludeHasRefAssetsOnly(), true, CapturedSettings->GetHashCalculator());
+                *PrescanPackages = PrescanVersion.AssetInfo.GetAssetLongPackageNames();
+                DoneEvent->Trigger();
+            });
+
+            // 等待游戏线程完成 prescan（只阻塞当前后台线程）
+            DoneEvent->Wait();
+            FPlatformProcess::ReturnSynchEventToPool(DoneEvent);
+
+            for (const auto& Pkg : *PrescanPackages)
+            {
+                PrescanPackageSets[i].Add(UFlibAssetManageHelper::PackagePathToLongPackageName(Pkg));
+            }
+        }
+    }
+
+    // 2. 构建全量 Canonical 包映射（来自 DiffInfo 的 Add/Modify）
+    TMap<FString, FPakCommand> CanonicalMap; // key-> dummy FPakCommand 用于占位
+    auto CollectFromDiff = [&](const TArray<FAssetDetail>& Assets)
+    {
+        for (const auto& Asset : Assets)
+        {
+            FString LongPackage = UFlibAssetManageHelper::PackagePathToLongPackageName(Asset.PackagePath.ToString());
+            if (!LongPackage.IsEmpty() && !CanonicalMap.Contains(LongPackage))
+            {
+                FPakCommand Dummy;
+                Dummy.AssetPackage = LongPackage;
+                CanonicalMap.Add(LongPackage, Dummy);
+            }
+        }
+    };
+    CollectFromDiff(DiffInfo.AssetDiffInfo.AddAssetDependInfo.GetAssetDetails());
+    CollectFromDiff(DiffInfo.AssetDiffInfo.ModifyAssetDependInfo.GetAssetDetails());
+
+    // 3. Owner-first 归属决定（优先命中 chunk.AssetIncludeFilters，其次使用 prescan 结果；否则放 Common）
+    auto IsPackageInFilter = [](const FString& PackageName, const FString& FilterPath) -> bool
+    {
+        if (FilterPath.IsEmpty() || PackageName.IsEmpty())
+        {
+            return false;
+        }
+        if (PackageName.Equals(FilterPath, ESearchCase::IgnoreCase))
+        {
+            return true;
+        }
+        const FString Prefix = FilterPath.EndsWith(TEXT("/")) ? FilterPath : (FilterPath + TEXT("/"));
+        return PackageName.StartsWith(Prefix, ESearchCase::IgnoreCase);
+    };
+    for (const auto& Pair : CanonicalMap)
+    {
+        const FString& PackageKey = Pair.Key;
+        int32 OwnerIdx = INDEX_NONE;
+        int32 BestPriority = TNumericLimits<int32>::Lowest();
+        for (int32 i = 0; i < Chunks.Num(); ++i)
+        {
+            const auto& Chunk = Chunks[i];
+            bool bMatches = false;
+            for (const auto& Include : Chunk.AssetIncludeFilters)
+            {
+                if (IsPackageInFilter(PackageKey, Include.Path))
+                {
+                    bMatches = true;
+                    break;
+                }
+            }
+            if (bMatches)
+            {
+                if (OwnerIdx == INDEX_NONE || Chunk.Priority > BestPriority)
+                {
+                    OwnerIdx = i;
+                    BestPriority = Chunk.Priority;
+                }
+            }
+        }
+
+        if (OwnerIdx != INDEX_NONE)
+        {
+            Result.FindOrAdd(Chunks[OwnerIdx].ChunkName).Add(PackageKey);
+            continue;
+        }
+
+        // 使用 prescan 查找是否只属于单个 chunk
+        int32 PrescanOwner = INDEX_NONE;
+        int32 FoundCount = 0;
+        for (int32 i = 0; i < PrescanPackageSets.Num(); ++i)
+        {
+            if (PrescanPackageSets[i].Contains(PackageKey))
+            {
+                PrescanOwner = i;
+                ++FoundCount;
+            }
+        }
+        if (FoundCount == 1 && PrescanOwner != INDEX_NONE)
+        {
+            Result.FindOrAdd(Chunks[PrescanOwner].ChunkName).Add(PackageKey);
+        }
+        else if (FoundCount > 1)
+        {
+            Result.FindOrAdd(TEXT("Common")).Add(PackageKey);
+        }
+        else
+        {
+            // 未在 prescan 中出现 -> treat as Common
+            Result.FindOrAdd(TEXT("Common")).Add(PackageKey);
+        }
+    }
+
+    // 4. 排序 & 去重（手动去重以避免额外依赖）
+    for (auto& KV : Result)
+    {
+        KV.Value.Sort();
+        TArray<FString> UniqueArr;
+        UniqueArr.Reserve(KV.Value.Num());
+        for (const auto& S : KV.Value)
+        {
+            if (!UniqueArr.Contains(S))
+            {
+                UniqueArr.Add(S);
+            }
+        }
+        KV.Value = MoveTemp(UniqueArr);
+    }
+
+    return Result;
+}
+
+
 TArray<FString> UFlibPatchParserHelper::CollectPakCommandsStringsByChunk(
 	const FPatchVersionDiff& DiffInfo,
 	const FChunkInfo& Chunk,

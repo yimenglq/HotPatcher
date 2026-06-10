@@ -156,6 +156,15 @@ public:
 		const FPatchVersionDiff& DiffInfo, const FChunkInfo& Chunk, TArray<ETargetPlatform> Platforms
 	);
 
+	// 新增：为 Preview 使用，基于 prescan + 主归属优先 计算最终每个 chunk 会包含的 package key 列表（按平台）
+	// 返回 map: ChunkName -> 包含的 LongPackageName 列表; 公共分块使用 key "Common"
+	static TMap<FString, TArray<FString>> CollectPreviewChunkPackageKeysByChunks(
+		const FHotPatcherSettingBase* PatcheSettings,
+		const FPatchVersionDiff& DiffInfo,
+		const TArray<FChunkInfo>& Chunks,
+		ETargetPlatform Platform
+	);
+
 	static TArray<FString> CollectPakCommandsStringsByChunk(
 		const FPatchVersionDiff& DiffInfo,
 		const FChunkInfo& Chunk,
