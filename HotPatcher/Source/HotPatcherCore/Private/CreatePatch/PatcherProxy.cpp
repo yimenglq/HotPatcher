@@ -710,6 +710,17 @@ namespace PatchWorker
 							}
 						}
 #endif
+						//添加chunk的外部文件
+						for (auto& FileMap : ChunkAssetsDescrible.AllPlatformExFiles)
+						{
+							for (auto& file : FileMap.Value.ExternFiles)
+							{
+
+								Context.AddExternalFile(PlatformName, Chunk.ChunkName, file);
+							}
+						}
+
+							
 					}
 				}
 			}
@@ -1172,6 +1183,19 @@ namespace PatchWorker
 								break;
 							}
 						}
+						//外部文件
+						if (!bMatchesIncludeFilter)
+						{
+							for (auto& platform :Chunk.AddExternAssetsToPlatform)
+							{
+								if(!platform.AddExternFileToPak.IsEmpty() && Chunk.ChunkName == PakCommand.ChunkName)
+								{
+									bMatchesIncludeFilter = true;
+									break;
+								}
+							}	
+						}
+
 						if (bMatchesIncludeFilter)
 						{
 							if (OwnerChunkArrayIndex == INDEX_NONE || Chunk.Priority > BestPriority)
@@ -1242,7 +1266,8 @@ namespace PatchWorker
 				FString ChunkSaveBasePath = Context.GetSettingObject()->GetChunkSavedDir(Context.CurrentVersion.VersionId,Context.CurrentVersion.BaseVersionId,Chunk.ChunkName,PlatformName);
 				// Step3: 为各业务分块生成 PakFileProxy
 				if(!Chunk.bMonolithic)
-				{
+				{	
+					
 					FPakFileProxy SinglePakForChunk;
 					SinglePakForChunk.Platform = Platform;
 					SinglePakForChunk.PakCommands = ChunkPakListCommands;

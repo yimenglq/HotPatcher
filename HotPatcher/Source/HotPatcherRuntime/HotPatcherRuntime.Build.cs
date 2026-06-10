@@ -101,6 +101,7 @@ public class HotPatcherRuntime : ModuleRules
 		
 		AddPublicDefinitions("AUTOLOAD_SHADERLIB_AT_RUNTIME", true);
 		bLegacyPublicIncludePaths = false;
-		OptimizeCode = CodeOptimization.InShippingBuildsOnly;
+		// OptimizeCode = CodeOptimization.InShippingBuildsOnly;
+		OptimizeCode = CodeOptimization.Never;
 	}
 }

@@ -976,12 +976,86 @@ FChunkAssetDescribe UFlibPatchParserHelper::CollectFChunkAssetsDescribeByChunk(
 						FExternFileInfo FileItem = SearchItem;
 						FileItem.Type = Type;
 						AllFiles.Add(FileItem);
+						UE_LOG(LogHotPatcher, Display, TEXT("[CollectExFiles][Diff][%s] %s (Mount:%s)"),
+							Type == EPatchAssetType::NEW ? TEXT("Add") : TEXT("Modify"),
+							*FileItem.GetReplaceMarkdFilePath(), *FileItem.MountPath);
 					}
 				}
 			}
 		};
 		CollectExtenFilesLambda(AddFilesRef, AllSearchFileFilter,EPatchAssetType::NEW);
 		CollectExtenFilesLambda(ModifyFilesRef, AllSearchFileFilter,EPatchAssetType::MODIFY);
+
+		// If chunk explicitly configured AddExternAssetsToPlatform, ensure those files are included
+		// even when DiffInfo does not mark them as added/modified (they may be unchanged but still should be packaged per chunk config).
+		for (int32 PlatformIndex = 0; PlatformIndex < Chunk.AddExternAssetsToPlatform.Num(); ++PlatformIndex)
+		{
+			if (Chunk.AddExternAssetsToPlatform[PlatformIndex].TargetPlatform != Platform)
+				continue;
+			// get all files defined by chunk config (directories + files)
+			FPlatformExternFiles PlatformFilesFromChunk = UFlibPatchParserHelper::GetAllExFilesByPlatform(Chunk.AddExternAssetsToPlatform[PlatformIndex], false, EHashCalculator::NoHash);
+			for (const auto& ExFile : PlatformFilesFromChunk.ExternFiles)
+			{
+                // Only add chunk-config extern files when they are actually added/modified in Diff
+                // If DiffInfo does not contain this platform at all (no base), then treat as added
+                bool bShouldAddFromChunkConfig = false;
+                // If DiffInfo does not contain the platform, that means base version has no extern info -> include chunk-config extern directly
+                bool bDiffContainsPlatform = DiffInfo.PlatformExternDiffInfo.Contains(Platform);
+                if (!bDiffContainsPlatform)
+                {
+                    bShouldAddFromChunkConfig = true;
+                }
+                // only add when present in AddFilesRef or ModifyFilesRef
+                FString ExPath = ExFile.GetReplaceMarkdFilePath();
+                for (const auto& AF : AddFilesRef)
+                {
+                    if (AF.GetReplaceMarkdFilePath().Equals(ExPath, ESearchCase::IgnoreCase))
+                    {
+                        bShouldAddFromChunkConfig = true;
+                        break;
+                    }
+                }
+				if (!bShouldAddFromChunkConfig)
+				{
+					for (const auto& MF : ModifyFilesRef)
+					{
+						if (MF.GetReplaceMarkdFilePath().Equals(ExPath, ESearchCase::IgnoreCase))
+						{
+							bShouldAddFromChunkConfig = true;
+							break;
+						}
+					}
+				}
+            if (bShouldAddFromChunkConfig)
+            {
+                // normalize path compare and avoid duplicates
+                ExPath = ExFile.GetReplaceMarkdFilePath();
+                FPaths::MakeStandardFilename(ExPath);
+				bool bFound = false;
+				for (const auto& Exist : AllFiles)
+				{
+					if (Exist.GetReplaceMarkdFilePath().Equals(ExPath, ESearchCase::IgnoreCase))
+					{
+						bFound = true;
+						break;
+					}
+				}
+				if (!bFound)
+				{
+					FExternFileInfo FileToAdd = ExFile;
+					FileToAdd.Type = EPatchAssetType::NEW;
+					FileToAdd.GenerateFileHash();
+					AllFiles.Add(FileToAdd);
+					UE_LOG(LogHotPatcher, Display, TEXT("[CollectExFiles][ChunkConfig][MatchedInDiff] %s (Mount:%s)"), *FileToAdd.GetReplaceMarkdFilePath(), *FileToAdd.MountPath);
+				}
+			}
+			else
+			{
+				// file present in chunk config but not in diff add/modify -> skip
+				UE_LOG(LogHotPatcher, Display, TEXT("[CollectExFiles][ChunkConfig][SkippedNotInDiff] %s (Mount:%s)"), *ExFile.GetReplaceMarkdFilePath(), *ExFile.MountPath);
+			}
+			}
+		}
 		return AllFiles;
 	};
 
@@ -1296,7 +1370,7 @@ TArray<FPakCommand> UFlibPatchParserHelper::CollectPakCommandByChunk(
 				FPakCommand CurrentPakCommand;
 				CurrentPakCommand.MountPath = CollectFile.MountPath;
 				CurrentPakCommand.AssetPackage = UFlibPatchParserHelper::MountPathToRelativePath(CurrentPakCommand.MountPath);
-				
+				CurrentPakCommand.ChunkName = Chunk.ChunkName;
 				// FString PakOptionsStr;
 				// for (const auto& Param : PakOptions)
 				// {
