@@ -110,7 +110,7 @@ void FCountServerlessWrapper::OnObjectIdReceived(FHttpRequestPtr Request, FHttpR
 		{
 			ToServerRequest = UpdateToServer(Desc,*NameIdMaps.Find(FApp::GetProjectName()));
 		}
-		else if(!!Count)
+		else
 		{
 			ToServerRequest = CreateToServer(Desc);
 		}

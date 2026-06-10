@@ -3,7 +3,11 @@
 
 #include "FlibPakHelper.h"
 #include "IPlatformFilePak.h"
+#if UE_VERSION_OLDER_THAN(5,0,0)
 #include "HAL/PlatformFilemanager.h"
+#else
+#include "HAL/PlatformFileManager.h"
+#endif
 #include "AssetManager/FFileArrayDirectoryVisitor.hpp"
 #include "HotPatcherLog.h"
 #include "FlibAssetManageHelper.h"
@@ -268,13 +272,18 @@ void UFlibPakHelper::CloseShaderbytecode(const FString& LibraryName)
 #endif
 void UFlibPakHelper::LoadShaderLibrary(const FString& ScanShaderLibs)
 {
+	EShaderPlatform ShaderPlatform = FShaderCodeLibrary::GetRuntimeShaderPlatform();
+	if (ShaderPlatform == SP_NumPlatforms)
+	{
+		return;
+	}
+	
 	UE_LOG(LogHotPatcher, Display, TEXT("Searching ShaderLibrary in %s."),*ScanShaderLibs);
 	TArray<FString> ShaderLibFiles;
 	bool bExist = UFlibPakHelper::ScanPlatformDirectory(ScanShaderLibs,true,false,true,ShaderLibFiles);
 	
 	if(bExist)
 	{
-		EShaderPlatform ShaderPlatform = FShaderCodeLibrary::GetRuntimeShaderPlatform();
 		bool bIOSPlatform = ::RHISupportsNativeShaderLibraries(ShaderPlatform);
 		const FString PlatformName = LegacyShaderPlatformToShaderFormat(ShaderPlatform).ToString();
 		// ShaderArchive-Base_EffectTemp-GLSL_ES3_1_ANDROID.ushaderbytecode
