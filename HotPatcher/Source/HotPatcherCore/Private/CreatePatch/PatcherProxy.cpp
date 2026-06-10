@@ -938,22 +938,120 @@ namespace PatchWorker
 		SCOPED_NAMED_EVENT_TEXT("GeneratePakProxysWorker",FColor::Red);
 		TimeRecorder PakChunkToralTR(FString::Printf(TEXT("Generate all platform pakproxys of all chunks Total Time:")));
 		TArray<ETargetPlatform> PakPlatforms = Context.GetSettingObject()->GetPakTargetPlatforms();
+		const FString CommonChunkName = TEXT("Common");
+
+		// 统一获取/创建 Common 分块（仅用于承载跨分块共享资源）
+		auto FindOrAddCommonChunk = [&Context, &CommonChunkName]() -> FChunkInfo&
+		{
+			for (auto& Chunk : Context.PakChunks)
+			{
+				if (Chunk.ChunkName.Equals(CommonChunkName, ESearchCase::CaseSensitive))
+				{
+					return Chunk;
+				}
+			}
+
+			FChunkInfo CommonChunk;
+			CommonChunk.ChunkName = CommonChunkName;
+			CommonChunk.bMonolithic = false;
+			CommonChunk.MonolithicPathMode = EMonolithicPathMode::MountPath;
+			CommonChunk.bOutputDebugInfo = true;
+			CommonChunk.bStorageUnrealPakList = Context.GetSettingObject()->bStorageUnrealPakList;
+			CommonChunk.bStorageIoStorePakList = Context.GetSettingObject()->GetIoStoreSettings().bStoragePakList;
+			Context.PakChunks.Add(CommonChunk);
+			return Context.PakChunks.Last();
+		};
+
 		for(const auto& Platform :PakPlatforms)
 		{
 			FString PlatformName = THotPatcherTemplateHelper::GetEnumNameByValue(Platform);
-			// PakModeSingleLambda(PlatformName, CurrentVersionSavePath);
-			for (auto& Chunk : Context.PakChunks)
+			// 仅处理业务分块，跳过已有 Common（避免重复参与统计）
+			TArray<int32> SourceChunkIndices;
+			for (int32 ChunkIndex = 0; ChunkIndex < Context.PakChunks.Num(); ++ChunkIndex)
 			{
+				const FChunkInfo& Chunk = Context.PakChunks[ChunkIndex];
+				if (!Chunk.ChunkName.Equals(CommonChunkName, ESearchCase::CaseSensitive))
+				{
+					SourceChunkIndices.Add(ChunkIndex);
+				}
+			}
+
+			auto GetCommandPackageKey = [](const FPakCommand& PakCommand) -> FString
+			{
+				if (!PakCommand.AssetPackage.IsEmpty())
+				{
+					return PakCommand.AssetPackage;
+				}
+				if (!PakCommand.GetMountPath().IsEmpty())
+				{
+					return UFlibPatchParserHelper::MountPathToRelativePath(PakCommand.GetMountPath());
+				}
+				return TEXT("");
+			};
+
+			auto IsPackageInFilter = [](const FString& PackageName, const FString& FilterPath) -> bool
+			{
+				if (FilterPath.IsEmpty() || PackageName.IsEmpty())
+				{
+					return false;
+				}
+				if (PackageName.Equals(FilterPath, ESearchCase::IgnoreCase))
+				{
+					return true;
+				}
+				const FString Prefix = FilterPath.EndsWith(TEXT("/")) ? FilterPath : (FilterPath + TEXT("/"));
+				return PackageName.StartsWith(Prefix, ESearchCase::IgnoreCase);
+			};
+
+			// Step0: 先按每个分块的 AssetIncludeFilters 扫描“带依赖全集”，用于后续分配/抽取 Common
+			TMap<FString, TSet<int32>> PrescanPackageToChunks;
+			for (int32 SourceChunkArrayIndex = 0; SourceChunkArrayIndex < SourceChunkIndices.Num(); ++SourceChunkArrayIndex)
+			{
+				const auto& SourceChunk = Context.PakChunks[SourceChunkIndices[SourceChunkArrayIndex]];
+				FChunkInfo PrescanChunk = SourceChunk;
+				PrescanChunk.bAnalysisFilterDependencies = true;
+				const FHotPatcherVersion PrescanVersion = UFlibPatchParserHelper::ExportReleaseVersionInfoByChunk(
+					TEXT(""),
+					TEXT(""),
+					TEXT(""),
+					PrescanChunk,
+					Context.GetSettingObject()->IsIncludeHasRefAssetsOnly(),
+					true,
+					Context.GetSettingObject()->GetHashCalculator()
+				);
+				TArray<FString> PrescanPackages = PrescanVersion.AssetInfo.GetAssetLongPackageNames();
+				TSet<FString> PrescanUniquePackages;
+				for (const auto& PackageName : PrescanPackages)
+				{
+					const FString PackageKey = UFlibAssetManageHelper::PackagePathToLongPackageName(PackageName);
+					if (!PackageKey.IsEmpty())
+					{
+						PrescanUniquePackages.Add(PackageKey);
+						PrescanPackageToChunks.FindOrAdd(PackageKey).Add(SourceChunkArrayIndex);
+					}
+				}
+
+				UE_LOG(LogHotPatcher, Display, TEXT("[CommonExtract][PreScan][%s] chunk=%s commands=%d unique_packages=%d"),
+					*PlatformName,
+					*SourceChunk.ChunkName,
+					PrescanPackages.Num(),
+					PrescanUniquePackages.Num());
+			}
+
+			TArray<TArray<FPakCommand>> ChunkPakCommandsByIndex;
+			ChunkPakCommandsByIndex.SetNum(SourceChunkIndices.Num());
+
+			// Step1: 收集每个分块的原始 PakCommand（此阶段尚未做共享资源抽取）
+			for (int32 SourceChunkArrayIndex = 0; SourceChunkArrayIndex < SourceChunkIndices.Num(); ++SourceChunkArrayIndex)
+			{
+				auto& Chunk = Context.PakChunks[SourceChunkIndices[SourceChunkArrayIndex]];
 				TimeRecorder PakChunkTR(FString::Printf(TEXT("Generate Chunk Platform:%s ChunkName:%s PakProxy Time:"),*PlatformName,*Chunk.ChunkName));
-				// Update Progress Dialog
 				{
 					FText Dialog = FText::Format(NSLOCTEXT("ExportPatch", "GeneratedPakCommands", "Generating UnrealPak Commands of {0} Platform Chunk {1}."), FText::FromString(PlatformName),FText::FromString(Chunk.ChunkName));
 					Context.OnPaking.Broadcast(TEXT("ExportPatch"),*Dialog.ToString());
 					Context.UnrealPakSlowTask->EnterProgressFrame(1.0, Dialog);
 				}
 
-				FString ChunkSaveBasePath = Context.GetSettingObject()->GetChunkSavedDir(Context.CurrentVersion.VersionId,Context.CurrentVersion.BaseVersionId,Chunk.ChunkName,PlatformName);
-				
 				TArray<FPakCommand> ChunkPakListCommands;
 				{
 					TimeRecorder CookAssetsTR(FString::Printf(TEXT("CollectPakCommandByChunk Platform:%s ChunkName:%s."),*PlatformName,*Chunk.ChunkName));
@@ -964,7 +1062,7 @@ namespace PatchWorker
 						Context.GetSettingObject()
 					);
 				}
-				
+
 				if(Context.PatchProxy)
 					Context.PatchProxy->OnPakListGenerated.Broadcast(Context,Chunk,Platform,ChunkPakListCommands);
 
@@ -999,14 +1097,14 @@ namespace PatchWorker
 							InIgnoreFormatsOptions
 							);
 					};
-					// 给所有的文件添加PakCommand的Option参数，默认只包含-compress，除了ExtensionsToNotUsePluginCompression中配置的文件都会添加
+
+				// 给所有的文件添加PakCommand的Option参数，默认只包含-compress，除了ExtensionsToNotUsePluginCompression中配置的文件都会添加
 					UFlibHotPatcherCoreHelper::AppendPakCommandOptions(PakCommand.PakCommands,Context.GetSettingObject()->GetUnrealPakSettings().UnrealPakListOptions,true,EmptyArray,IgnoreCompressFormats,CompressOption);
 					UFlibHotPatcherCoreHelper::AppendPakCommandOptions(PakCommand.PakCommands,Context.GetSettingObject()->GetDefaultPakListOptions(),true,EmptyArray,IgnoreCompressFormats,CompressOption);
 					UFlibHotPatcherCoreHelper::AppendPakCommandOptions(PakCommand.IoStoreCommands,Context.GetSettingObject()->GetIoStoreSettings().IoStorePakListOptions,true,EmptyArray,IgnoreCompressFormats,CompressOption);
 					UFlibHotPatcherCoreHelper::AppendPakCommandOptions(PakCommand.IoStoreCommands,Context.GetSettingObject()->GetDefaultPakListOptions(),true,EmptyArray,IgnoreCompressFormats,CompressOption);
 
 					FEncryptSetting EncryptSettings = UFlibPatchParserHelper::GetCryptoSettingByPakEncryptSettings(Context.GetSettingObject()->GetEncryptSettings());
-					
 					// 加密所有文件
 					if(EncryptSettings.bEncryptAllAssetFiles)
 					{
@@ -1020,7 +1118,6 @@ namespace PatchWorker
 						{
 							TArray<FString> EncryptOption{TEXT("-encrypt")};
 							TArray<FString> EncryptFileExtersion{TEXT("uasset")};
-						
 							AppendPakCommandOptions(PakCommand,EncryptOption,false,EncryptFileExtersion,EmptyArray,EmptyArray);
 						}
 						// 加密 ini
@@ -1032,7 +1129,108 @@ namespace PatchWorker
 						}
 					}
 				}
-				
+
+				ChunkPakCommandsByIndex[SourceChunkArrayIndex] = MoveTemp(ChunkPakListCommands);
+			}
+
+			TArray<FPakCommand> CommonChunkPakCommands;
+			{
+				// Step2: 先确定“主归属分块”（命中 AssetIncludeFilters），再做共享依赖提取
+				TMap<FString, FPakCommand> CanonicalPakCommandMap;
+				for (const auto& ChunkPakCommands : ChunkPakCommandsByIndex)
+				{
+					for (const auto& PakCommand : ChunkPakCommands)
+					{
+						const FString PackageKey = GetCommandPackageKey(PakCommand);
+						if (!PackageKey.IsEmpty() && !CanonicalPakCommandMap.Contains(PackageKey))
+						{
+							CanonicalPakCommandMap.Add(PackageKey, PakCommand);
+						}
+					}
+				}
+
+				TArray<TArray<FPakCommand>> ReassignedChunkPakCommandsByIndex;
+				ReassignedChunkPakCommandsByIndex.SetNum(SourceChunkIndices.Num());
+				TArray<FString> CommonPackageKeys;
+
+				for (const auto& CommandPair : CanonicalPakCommandMap)
+				{
+					const FString& PackageKey = CommandPair.Key;
+					const FPakCommand& PakCommand = CommandPair.Value;
+
+					int32 OwnerChunkArrayIndex = INDEX_NONE;
+					int32 BestPriority = TNumericLimits<int32>::Lowest();
+					for (int32 SourceChunkArrayIndex = 0; SourceChunkArrayIndex < SourceChunkIndices.Num(); ++SourceChunkArrayIndex)
+					{
+						const auto& Chunk = Context.PakChunks[SourceChunkIndices[SourceChunkArrayIndex]];
+						bool bMatchesIncludeFilter = false;
+						for (const auto& IncludeFilter : Chunk.AssetIncludeFilters)
+						{
+							if (IsPackageInFilter(PackageKey, IncludeFilter.Path))
+							{
+								bMatchesIncludeFilter = true;
+								break;
+							}
+						}
+						if (bMatchesIncludeFilter)
+						{
+							if (OwnerChunkArrayIndex == INDEX_NONE || Chunk.Priority > BestPriority)
+							{
+								OwnerChunkArrayIndex = SourceChunkArrayIndex;
+								BestPriority = Chunk.Priority;
+							}
+						}
+					}
+
+					if (OwnerChunkArrayIndex != INDEX_NONE)
+					{
+						ReassignedChunkPakCommandsByIndex[OwnerChunkArrayIndex].Add(PakCommand);
+						continue;
+					}
+
+					const TSet<int32>* PrescanChunks = PrescanPackageToChunks.Find(PackageKey);
+					if (PrescanChunks && PrescanChunks->Num() > 1)
+					{
+						CommonChunkPakCommands.Add(PakCommand);
+						CommonPackageKeys.Add(PackageKey);
+					}
+					else if (PrescanChunks && PrescanChunks->Num() == 1)
+					{
+						const int32 TargetChunkArrayIndex = PrescanChunks->Array()[0];
+						if (ReassignedChunkPakCommandsByIndex.IsValidIndex(TargetChunkArrayIndex))
+						{
+							ReassignedChunkPakCommandsByIndex[TargetChunkArrayIndex].Add(PakCommand);
+						}
+					}
+					else
+					{
+						CommonChunkPakCommands.Add(PakCommand);
+						CommonPackageKeys.Add(PackageKey);
+					}
+				}
+
+				ChunkPakCommandsByIndex = MoveTemp(ReassignedChunkPakCommandsByIndex);
+				CommonPackageKeys.Sort();
+
+				if (CommonChunkPakCommands.Num())
+				{
+					UE_LOG(LogHotPatcher, Display, TEXT("Extract %d shared assets to common chunk for %s."), CommonChunkPakCommands.Num(), *PlatformName);
+					UE_LOG(LogHotPatcher, Display, TEXT("[CommonExtract][%s] duplicated_packages=%d"), *PlatformName, CommonPackageKeys.Num());
+					for (const auto& CommonPackage : CommonPackageKeys)
+					{
+						UE_LOG(LogHotPatcher, Verbose, TEXT("[CommonExtract][%s] package=%s"), *PlatformName, *CommonPackage);
+					}
+				}
+				else
+				{
+					UE_LOG(LogHotPatcher, Display, TEXT("[CommonExtract][%s] no duplicated asset package found."), *PlatformName);
+				}
+			}
+
+			for (int32 SourceChunkArrayIndex = 0; SourceChunkArrayIndex < SourceChunkIndices.Num(); ++SourceChunkArrayIndex)
+			{
+				auto& Chunk = Context.PakChunks[SourceChunkIndices[SourceChunkArrayIndex]];
+				auto& ChunkPakListCommands = ChunkPakCommandsByIndex[SourceChunkArrayIndex];
 				if (!ChunkPakListCommands.Num())
 				{
 					FString Msg = FString::Printf(TEXT("Chunk:%s not contain any file!!!"), *Chunk.ChunkName);
@@ -1040,7 +1238,9 @@ namespace PatchWorker
 					Context.OnShowMsg.Broadcast(Msg);
 					continue;
 				}
-				
+
+				FString ChunkSaveBasePath = Context.GetSettingObject()->GetChunkSavedDir(Context.CurrentVersion.VersionId,Context.CurrentVersion.BaseVersionId,Chunk.ChunkName,PlatformName);
+				// Step3: 为各业务分块生成 PakFileProxy
 				if(!Chunk.bMonolithic)
 				{
 					FPakFileProxy SinglePakForChunk;
@@ -1055,7 +1255,6 @@ namespace PatchWorker
 						Chunk.ChunkName,
 						PlatformName
 					};
-					
 					const FString ChunkPakName = UFlibHotPatcherCoreHelper::ReplacePakRegular(PakPathRegular,Context.GetSettingObject()->GetPakNameRegular());
 					SinglePakForChunk.ChunkStoreName = ChunkPakName;
 					SinglePakForChunk.StorageDirectory = ChunkSaveBasePath;
@@ -1074,22 +1273,44 @@ namespace PatchWorker
 						switch (Chunk.MonolithicPathMode)
 						{
 						case EMonolithicPathMode::MountPath:
-							{
-								Path = UFlibPatchParserHelper::MountPathToRelativePath(PakCommand.GetMountPath());
-								break;
-
-							};
+							Path = UFlibPatchParserHelper::MountPathToRelativePath(PakCommand.GetMountPath());
+							break;
 						case  EMonolithicPathMode::PackagePath:
-							{
-								Path = PakCommand.AssetPackage;
-								break;
-							}
+							Path = PakCommand.AssetPackage;
+							break;
 						}
 						CurrentPak.ChunkStoreName = Path;
 						CurrentPak.StorageDirectory = FPaths::Combine(ChunkSaveBasePath, Chunk.ChunkName);
 						Chunk.GetPakFileProxys().Add(CurrentPak);
 					}
 				}
+			}
+
+			if (CommonChunkPakCommands.Num())
+			{
+				// Step4: 为 Common 分块生成 PakFileProxy
+				// 注意：这里同样走 ReplacePakRegular，严格遵守项目分块命名规则
+				// CommonChunkPakCommands 来自已经处理完选项的 ChunkPakCommandsByIndex，避免重复追加 -compress/-encrypt
+
+				auto& CommonChunk = FindOrAddCommonChunk();
+				FString ChunkSaveBasePath = Context.GetSettingObject()->GetChunkSavedDir(Context.CurrentVersion.VersionId,Context.CurrentVersion.BaseVersionId,CommonChunk.ChunkName,PlatformName);
+
+				FPakFileProxy CommonChunkProxy;
+				CommonChunkProxy.Platform = Platform;
+				CommonChunkProxy.PakCommands = CommonChunkPakCommands;
+				CommonChunkProxy.PakCommands.Append(Context.AdditionalFileToPak);
+
+				FReplacePakRegular PakPathRegular{
+					Context.CurrentVersion.VersionId,
+					Context.CurrentVersion.BaseVersionId,
+					CommonChunk.ChunkName,
+					PlatformName
+				};
+
+				const FString ChunkPakName = UFlibHotPatcherCoreHelper::ReplacePakRegular(PakPathRegular,Context.GetSettingObject()->GetPakNameRegular());
+				CommonChunkProxy.ChunkStoreName = ChunkPakName;
+				CommonChunkProxy.StorageDirectory = ChunkSaveBasePath;
+				CommonChunk.GetPakFileProxys().Add(CommonChunkProxy);
 			}
 		}
 		return true;

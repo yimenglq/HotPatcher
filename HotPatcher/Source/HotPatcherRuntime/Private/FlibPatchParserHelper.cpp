@@ -927,37 +927,8 @@ FChunkAssetDescribe UFlibPatchParserHelper::CollectFChunkAssetsDescribeByChunk(
 	FChunkAssetDescribe ChunkAssetDescribe;
 	
 	{
-		auto FilterAssetDependenciesByChunk = [&Chunk, PatcheSettings](const FAssetDependenciesInfo& InAssets)->FAssetDependenciesInfo
-		{
-			FAssetDependenciesInfo Result;
-			if (!PatcheSettings)
-			{
-				return InAssets;
-			}
-
-			const FHotPatcherVersion ChunkVersion = UFlibPatchParserHelper::ExportReleaseVersionInfoByChunk(
-				TEXT(""),
-				TEXT(""),
-				TEXT(""),
-				Chunk,
-				PatcheSettings->IsIncludeHasRefAssetsOnly(),
-				Chunk.bAnalysisFilterDependencies,
-				PatcheSettings->GetHashCalculator()
-			);
-
-			for (const auto& AssetDetail : InAssets.GetAssetDetails())
-			{
-				const FString AssetLongPackageName = UFlibAssetManageHelper::PackagePathToLongPackageName(AssetDetail.PackagePath.ToString());
-				if (ChunkVersion.AssetInfo.HasAsset(AssetLongPackageName))
-				{
-					Result.AddAssetsDetail(AssetDetail);
-				}
-			}
-			return Result;
-		};
-
-		ChunkAssetDescribe.AddAssets = FilterAssetDependenciesByChunk(DiffInfo.AssetDiffInfo.AddAssetDependInfo);
-		ChunkAssetDescribe.ModifyAssets = FilterAssetDependenciesByChunk(DiffInfo.AssetDiffInfo.ModifyAssetDependInfo);
+		ChunkAssetDescribe.AddAssets = DiffInfo.AssetDiffInfo.AddAssetDependInfo;
+		ChunkAssetDescribe.ModifyAssets = DiffInfo.AssetDiffInfo.ModifyAssetDependInfo;
 		ChunkAssetDescribe.Assets = UFlibAssetManageHelper::CombineAssetDependencies(ChunkAssetDescribe.AddAssets, ChunkAssetDescribe.ModifyAssets);
 	}
 
