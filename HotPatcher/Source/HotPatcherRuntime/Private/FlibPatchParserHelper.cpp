@@ -31,6 +31,8 @@
 #include "Misc/FileHelper.h"
 #include "Serialization/LargeMemoryReader.h"
 
+
+
 TArray<FString> UFlibPatchParserHelper::GetAvailableMaps(FString GameName, bool IncludeEngineMaps, bool IncludePluginMaps, bool Sorted)
 {
 	const FString WildCard = FString::Printf(TEXT("*%s"), *FPackageName::GetMapPackageExtension());
@@ -925,10 +927,10 @@ FChunkAssetDescribe UFlibPatchParserHelper::CollectFChunkAssetsDescribeByChunk(
 {
 	SCOPED_NAMED_EVENT_TEXT("CollectFChunkAssetsDescribeByChunk",FColor::Red);
 	FChunkAssetDescribe ChunkAssetDescribe;
-	
+
 	{
-		ChunkAssetDescribe.AddAssets = DiffInfo.AssetDiffInfo.AddAssetDependInfo; // CollectChunkAssets(AddAssetsRef, AssetFilterPaths);
-		ChunkAssetDescribe.ModifyAssets = DiffInfo.AssetDiffInfo.ModifyAssetDependInfo; //CollectChunkAssets(ModifyAssetsRef, AssetFilterPaths);
+		ChunkAssetDescribe.AddAssets = DiffInfo.AssetDiffInfo.AddAssetDependInfo;
+		ChunkAssetDescribe.ModifyAssets = DiffInfo.AssetDiffInfo.ModifyAssetDependInfo;
 		ChunkAssetDescribe.Assets = UFlibAssetManageHelper::CombineAssetDependencies(ChunkAssetDescribe.AddAssets, ChunkAssetDescribe.ModifyAssets);
 	}
 
