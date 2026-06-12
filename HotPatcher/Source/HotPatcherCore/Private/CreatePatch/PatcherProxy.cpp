@@ -769,24 +769,7 @@ namespace PatchWorker
 	bool ResolveCommonChunkWorker(FHotPatcherPatchContext& Context)
 	{
 		SCOPED_NAMED_EVENT_TEXT("ResolveCommonChunkWorker",FColor::Red);
-		/*
-		Purpose and algorithm (enforced rules):
-		1) For each chunk collect TWO views:
-		   - explicitSet: assets directly matched by the chunk's include-filters (explicit-only scan)
-		   - depExpandedSet: assets required by the chunk including recursive dependencies (dependency-expanded)
-		2) Guarantee: depExpandedSet for a chunk MUST NOT contain assets that are explicitly matched by any other chunk's filters.
-		   To enforce this we subtract the union of other chunks' explicitSet from this chunk's depExpandedSet.
-		3) Ownership decision:
-		   - If an asset is explicit in one or more chunks -> assign to single owner by priority/tiebreak.
-		   - If an asset is not explicit anywhere but appears in >=2 depExpanded sets -> place into Common.
-		   - If asset appears in exactly one depExpanded (after subtraction) -> assign to that chunk.
-		4) We only consider project (Game) module assets for Common to avoid classifying engine/plugin assets as shared.
-		
-		Notes:
-		- We use explicit-only scans to determine authoritative ownership and then expand dependencies per chunk
-		  while excluding other chunks' explicit assets to prevent ownership leakage.
-		- Empty explicit sets are WARNed (not fatal) because diff-mode can legitimately produce empty chunk filters.
-		*/
+	
 		if (!Context.GetSettingObject()->IsEnableChunk() || Context.PakChunks.Num() <= 1)
 		{
 			return true;
@@ -794,9 +777,12 @@ namespace PatchWorker
 
 		TimeRecorder ResolveCommonTR(TEXT("Resolve Common Chunk assets"));
 
+		//分块过滤器下的资产
 		TMap<FString, TSet<FString>> ChunkOwnedPackages;
+		
+		//所有分块过滤器下的资产依赖的详情 用于后续添加到分块描述中
 		TMap<FString, FAssetDetail> PackageToAssetDetail;
-
+		//获得分块 所有依赖的引用
 		for (const auto& Chunk : Context.PakChunks)
 		{
 			TimeRecorder ChunkScanTR(FString::Printf(TEXT("Scan Chunk %s for assignment"), *Chunk.ChunkName));
@@ -818,6 +804,27 @@ namespace PatchWorker
 			{
 				FString PkgName = UFlibAssetManageHelper::PackagePathToLongPackageName(Detail.PackagePath.ToString());
 				PkgSet.Add(PkgName);
+				
+			}
+		}
+
+		//在分块下的所有引用
+		TMap<FString, TSet<FString>> ChunkPackagesAll;
+		for (const auto& Chunk : Context.PakChunks)
+		{
+			FHotPatcherVersion ChunkVersion = UFlibPatchParserHelper::ExportReleaseVersionInfoByChunk(
+				TEXT(""), TEXT(""), TEXT(""),
+				Chunk,
+				false,
+				true,
+				Context.GetSettingObject()->GetHashCalculator()
+			);
+
+			TSet<FString>& PkgSet = ChunkPackagesAll.FindOrAdd(Chunk.ChunkName);
+			for (const auto& Detail : ChunkVersion.AssetInfo.GetAssetDetails())
+			{
+				FString PkgName = UFlibAssetManageHelper::PackagePathToLongPackageName(Detail.PackagePath.ToString());
+				PkgSet.Add(PkgName);
 				if (!PackageToAssetDetail.Contains(PkgName))
 				{
 					PackageToAssetDetail.Add(PkgName, Detail);
@@ -825,177 +832,115 @@ namespace PatchWorker
 			}
 		}
 
-        // Build owners map from explicit sets
-        TMap<FString, TSet<FString>> PackageOwners;
-        for (const auto& Pair : ChunkOwnedPackages)
-        {
-            for (const auto& PkgName : Pair.Value)
-            {
-                PackageOwners.FindOrAdd(PkgName).Add(Pair.Key);
-            }
-        }
+		//所有过滤分块下取补集
+		TMap<FString, TSet<FString>> ChunkDifferencePackages;
+		for (const auto& Pair : ChunkPackagesAll)
+		{
+			auto& DiffSet = ChunkDifferencePackages.FindOrAdd(Pair.Key);
+			TSet<FString> ChunksDiffe = Pair.Value;
+			for (const auto& OwnedPair : ChunkOwnedPackages)
+			{
+				ChunksDiffe = ChunksDiffe.Difference(OwnedPair.Value);
+			}	
+			DiffSet = MoveTemp(ChunksDiffe);
+			
+		}
 
-        // Collect dep-expanded package sets per chunk (use CollectFChunkAssetsDescribeByChunk)
-        TMap<FString, TSet<FString>> ChunkDepExpandedPkgs;
-        TMap<FString, TMap<FString, FAssetDetail>> ChunkDepDetailMap; // chunk -> (longpkg -> detail)
-        TArray<ETargetPlatform> AllPlatforms;
-        Context.VersionDiff.PlatformExternDiffInfo.GetKeys(AllPlatforms);
+		//剔除补集下 公共部分  > 2
+		TSet<FString> CommonDifferencePackages;
+		TSet<FString> TempAllDifferencePackages;
+		
+		//收集公共部分
+		TSet<FString> TempSet;
+		for (auto& Pair : ChunkDifferencePackages)
+		{
+			for (const auto& Pkg : Pair.Value)
+			{
+				if (TempAllDifferencePackages.Contains(Pkg))
+				{
+					CommonDifferencePackages.Add(Pkg);
+					TempSet.Add(Pkg);
+					UE_LOG(LogHotPatcher, Log, TEXT("CommonPackages:%d  %s"), CommonDifferencePackages.Num(), *Pkg);					
+				}
+				else
+				{
+					TempAllDifferencePackages.Add(Pkg);
+				}
+			}
+		}
 
-        for (const auto& Chunk : Context.PakChunks)
-        {
-            FChunkAssetDescribe DepDesc = UFlibPatchParserHelper::CollectFChunkAssetsDescribeByChunk(
-                Context.GetSettingObject(), Context.VersionDiff, Chunk, TArray<ETargetPlatform>{ETargetPlatform::AllPlatforms}
-            );
-            TSet<FString>& DepSet = ChunkDepExpandedPkgs.FindOrAdd(Chunk.ChunkName);
-            TMap<FString, FAssetDetail>& DepDetailMap = ChunkDepDetailMap.FindOrAdd(Chunk.ChunkName);
-            for (const auto& Asset : DepDesc.Assets.GetAssetDetails())
-            {
-                FString LongPkg = UFlibAssetManageHelper::PackagePathToLongPackageName(Asset.PackagePath.ToString());
-                DepSet.Add(LongPkg);
-                if (!DepDetailMap.Contains(LongPkg))
-                {
-                    DepDetailMap.Add(LongPkg, Asset);
-                }
-            }
-        }
+		//剔除公共部分
+		for (auto& Pair : ChunkDifferencePackages)
+		{
+			Pair.Value = Pair.Value.Difference(TempSet);	
+		}
 
-        // Build initial CommonPackages from explicit multi-owners (only Game module)
-        TSet<FString> CommonPackages;
-        for (const auto& Pair : PackageOwners)
-        {
-            FString BelongModule = UFlibAssetManageHelper::GetAssetBelongModuleName(Pair.Key);
-            if (Pair.Value.Num() >= 2 && BelongModule.Equals(TEXT("Game"), ESearchCase::IgnoreCase))
-            {
-                CommonPackages.Add(Pair.Key);
-            }
-        }
+		TempSet.Empty();
+		TempAllDifferencePackages.Empty();
 
-        // For dep-only packages (not explicit anywhere), if they appear in >=2 chunk dep-expanded sets -> Common
-        TMap<FString, int32> DepPkgCounter;
-        for (const auto& Pair : ChunkDepExpandedPkgs)
-        {
-            for (const auto& Pkg : Pair.Value)
-            {
-                if (!PackageOwners.Contains(Pkg))
-                {
-                    DepPkgCounter.FindOrAdd(Pkg) += 1;
-                }
-            }
-        }
-        for (const auto& Pair : DepPkgCounter)
-        {
-            if (Pair.Value >= 2)
-            {
-                FString BelongModule = UFlibAssetManageHelper::GetAssetBelongModuleName(Pair.Key);
-                if (BelongModule.Equals(TEXT("Game"), ESearchCase::IgnoreCase))
-                {
-                    CommonPackages.Add(Pair.Key);
-                }
-            }
-        }
+		//将剔除公共部分 每个分块剩下补集 添加到分块的资产列表中
+		for (auto& Pair : ChunkOwnedPackages)
+		{
+			auto DiffSet = ChunkDifferencePackages.Find(Pair.Key);
+			Pair.Value.Append(*DiffSet);
+		}
 
-        // Now build final chunk describes: explicit-owned (single-owner) + dep-expanded (after excluding other chunk explicit pkgs and commons)
-        for (const auto& Chunk : Context.PakChunks)
-        {
-            FChunkAssetDescribe Desc;
 
-            // Add explicit-only packages that belong to this chunk (skip commons)
-            const TSet<FString>& ChunkPkgs = ChunkOwnedPackages.FindRef(Chunk.ChunkName);
-            for (const auto& PkgName : ChunkPkgs)
-            {
-                if (CommonPackages.Contains(PkgName))
-                {
-                    continue;
-                }
-                if (PackageToAssetDetail.Contains(PkgName))
-                {
-                    Desc.AddAssets.AddAssetsDetail(PackageToAssetDetail[PkgName]);
-                }
-            }
+		TArray<ETargetPlatform> AllPlatforms;
+		Context.VersionDiff.PlatformExternDiffInfo.GetKeys(AllPlatforms);
 
-            // Build union of explicit packages from other chunks to exclude
-            TSet<FString> OtherChunkExplicitPkgs;
-            for (const auto& Pair : ChunkOwnedPackages)
-            {
-                if (Pair.Key == Chunk.ChunkName) continue;
-                OtherChunkExplicitPkgs.Append(Pair.Value);
-            }
+		for (const auto& Chunk : Context.PakChunks)
+		{
+			FChunkAssetDescribe Desc;
 
-            // Add dep-expanded assets for this chunk, excluding other-chunk explicit pkgs and commons
-            const TSet<FString>& DepSet = ChunkDepExpandedPkgs.FindRef(Chunk.ChunkName);
-            const TMap<FString, FAssetDetail>& DepDetailMap = ChunkDepDetailMap.FindRef(Chunk.ChunkName);
-            for (const auto& LongPkg : DepSet)
-            {
-                if (OtherChunkExplicitPkgs.Contains(LongPkg))
-                {
-                    UE_LOG(LogHotPatcher, Display, TEXT("Exclude %s from chunk %s because it's explicitly claimed by another chunk's filter"), *LongPkg, *Chunk.ChunkName);
-                    continue;
-                }
-                if (CommonPackages.Contains(LongPkg))
-                {
-                    continue;
-                }
+			// 添加显式分块资产（不包含公共资产）
+			const TSet<FString>& ChunkPkgs = ChunkOwnedPackages.FindRef(Chunk.ChunkName);
+			for (const auto& PkgName : ChunkPkgs)
+			{
+				Desc.AddAssets.AddAssetsDetail(PackageToAssetDetail[PkgName]);	
+			}
 
-                // Prefer explicit detail if available, else use dependency detail
-                if (PackageToAssetDetail.Contains(LongPkg))
-                {
-                    Desc.AddAssets.AddAssetsDetail(PackageToAssetDetail[LongPkg]);
-                }
-                else if (DepDetailMap.Contains(LongPkg))
-                {
-                    Desc.AddAssets.AddAssetsDetail(DepDetailMap[LongPkg]);
-                }
-            }
+			Desc.Assets = Desc.AddAssets;
 
-            Desc.Assets = Desc.AddAssets;
+			// Collect extern files per-platform (use existing helper)
+			for (auto Platform : AllPlatforms)
+			{
 
-            // Collect extern files per-platform (use existing helper)
-            for (auto Platform : AllPlatforms)
-            {
-                FPlatformExternFiles PlatformFiles;
-                PlatformFiles.Platform = Platform;
-                PlatformFiles.ExternFiles = UFlibPatchParserHelper::CollectFChunkAssetsDescribeByChunk(
-                    Context.GetSettingObject(), Context.VersionDiff, Chunk, TArray<ETargetPlatform>{Platform}
-                ).GetExFilesByPlatform(Platform);
-                Desc.AllPlatformExFiles.Add(Platform, PlatformFiles);
-            }
+				FPlatformExternFiles PlatformFiles;
+				PlatformFiles.Platform = Platform;
+				PlatformFiles.ExternFiles = UFlibPatchParserHelper::CollectFChunkAssetsDescribeByChunk(
+					Context.GetSettingObject(), Context.VersionDiff, Chunk, TArray<ETargetPlatform>{Platform}
+				).GetExFilesByPlatform(Platform);
+				Desc.AllPlatformExFiles.Add(Platform, PlatformFiles);
+			}
 
-            Desc.InternalFiles = Chunk.InternalFiles;
-            Context.ChunkDescribeCache.Add(Chunk.ChunkName, Desc);
-        }
+			Desc.InternalFiles = Chunk.InternalFiles;
+			Context.ChunkDescribeCache.Add(Chunk.ChunkName, Desc);
+		}
 
-        // Build Common chunk describe from CommonPackages
-        if (CommonPackages.Num() > 0)
-        {
-            Context.CommonChunkDescribe = FChunkAssetDescribe();
-            for (const auto& PkgName : CommonPackages)
-            {
-                if (PackageToAssetDetail.Contains(PkgName))
-                {
-                    Context.CommonChunkDescribe.AddAssets.AddAssetsDetail(PackageToAssetDetail[PkgName]);
-                }
-                else
-                {
-                    // try to find detail from any chunk's dep detail map
-                    for (const auto& Pair : ChunkDepDetailMap)
-                    {
-                        if (Pair.Value.Contains(PkgName))
-                        {
-                            Context.CommonChunkDescribe.AddAssets.AddAssetsDetail(Pair.Value[PkgName]);
-                            break;
-                        }
-                    }
-                }
-            }
-            Context.CommonChunkDescribe.Assets = Context.CommonChunkDescribe.AddAssets;
+		//构建分块 公共部分
+		if (CommonDifferencePackages.Num() > 0)
+		{
+			Context.CommonChunkDescribe = FChunkAssetDescribe();
+			for (const auto& PkgName : CommonDifferencePackages)
+			{
+				if (PackageToAssetDetail.Contains(PkgName))
+				{
+					Context.CommonChunkDescribe.AddAssets.AddAssetsDetail(PackageToAssetDetail[PkgName]);
+				}
+			}
 
-            if (Context.CommonChunkDescribe.HasValidAssets())
-            {
-                Context.PakChunks.Add(Context.CommonChunkDescribe.AsChunkInfo(Context.CommonChunkName));
-                Context.ChunkDescribeCache.Add(Context.CommonChunkName, Context.CommonChunkDescribe);
-                UE_LOG(LogHotPatcher, Display, TEXT("Resolved Common chunk with %d shared assets"), CommonPackages.Num());
-            }
-        }
+			Context.CommonChunkDescribe.Assets = Context.CommonChunkDescribe.AddAssets;
+
+			if (Context.CommonChunkDescribe.HasValidAssets())
+			{
+				Context.PakChunks.Add(Context.CommonChunkDescribe.AsChunkInfo(Context.CommonChunkName));
+				Context.ChunkDescribeCache.Add(Context.CommonChunkName, Context.CommonChunkDescribe);
+				UE_LOG(LogHotPatcher, Log, TEXT("Resolved Common chunk with %d shared assets"), CommonDifferencePackages.Num());
+			}
+		}
+
+
 
 		return true;
 	};

@@ -196,7 +196,7 @@ public class HotPatcherCore : ModuleRules
 		});
 		PrivateDefinitions.AddRange(new string[]
 		{
-            "DEBUG=0"
+            "DEBUG=1"
         });
     }
 }
