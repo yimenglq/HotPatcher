@@ -786,13 +786,9 @@ namespace PatchWorker
 		for (const auto& Chunk : Context.PakChunks)
 		{
 			TimeRecorder ChunkScanTR(FString::Printf(TEXT("Scan Chunk %s for assignment"), *Chunk.ChunkName));
-            // Use explicit-only export here (disable dependency analysis) so we get
-            // the authoritative list of assets *explicitly* assigned to this chunk.
-            // Relying on dependency-expanded results (AllLoadedPackageSet) causes
-            // shared dependency assets (engine/plugins) to appear in multiple
-            // chunk scans and be mis-classified as common.
+          
             FHotPatcherVersion ChunkVersion = UFlibPatchParserHelper::ExportReleaseVersionInfoByChunk(
-                TEXT(""), TEXT(""), TEXT(""),
+				TEXT(""), TEXT(""), TEXT(""),
                 Chunk,
                 false,
                 false, // explicit-only, do NOT analysis filter dependencies here
@@ -808,19 +804,33 @@ namespace PatchWorker
 			}
 		}
 
-		//在分块下的所有引用
+        // Build a set of diff package names (Add + Modify) so we only assign changed assets to chunks
+        TSet<FString> DiffPackageNames;
+        {
+            const TArray<FAssetDetail> AddDetails = Context.VersionDiff.AssetDiffInfo.AddAssetDependInfo.GetAssetDetails();
+            const TArray<FAssetDetail> ModDetails = Context.VersionDiff.AssetDiffInfo.ModifyAssetDependInfo.GetAssetDetails();
+            for (const auto& D : AddDetails)
+            {
+                DiffPackageNames.Add(UFlibAssetManageHelper::PackagePathToLongPackageName(D.PackagePath.ToString()));
+            }
+            for (const auto& D : ModDetails)
+            {
+                DiffPackageNames.Add(UFlibAssetManageHelper::PackagePathToLongPackageName(D.PackagePath.ToString()));
+            }
+        }
+
+		//在分块下的所有引用（基于Diff）
 		TMap<FString, TSet<FString>> ChunkPackagesAll;
 		for (const auto& Chunk : Context.PakChunks)
 		{
-			FHotPatcherVersion ChunkVersion = UFlibPatchParserHelper::ExportReleaseVersionInfoByChunk(
-				TEXT(""), TEXT(""), TEXT(""),
-				Chunk,
-				false,
-				true,
-				Context.GetSettingObject()->GetHashCalculator()
-			);
+			FHotPatcherVersion ChunkVersion = UFlibPatchParserHelper::DiffAssetByChunk(
+                Context.VersionDiff,
+                Chunk,
+                true,
+                Context.GetSettingObject()->GetHashCalculator()
+            );
 
-			TSet<FString>& PkgSet = ChunkPackagesAll.FindOrAdd(Chunk.ChunkName);
+            TSet<FString>& PkgSet = ChunkPackagesAll.FindOrAdd(Chunk.ChunkName);
 			for (const auto& Detail : ChunkVersion.AssetInfo.GetAssetDetails())
 			{
 				FString PkgName = UFlibAssetManageHelper::PackagePathToLongPackageName(Detail.PackagePath.ToString());
@@ -828,9 +838,9 @@ namespace PatchWorker
 				if (!PackageToAssetDetail.Contains(PkgName))
 				{
 					PackageToAssetDetail.Add(PkgName, Detail);
-				}
-			}
-		}
+                }
+            }
+        }
 
 		//所有过滤分块下取补集
 		TMap<FString, TSet<FString>> ChunkDifferencePackages;
@@ -892,15 +902,43 @@ namespace PatchWorker
 		for (const auto& Chunk : Context.PakChunks)
 		{
 			FChunkAssetDescribe Desc;
+			const TArray<FAssetDetail>& DiffAddAssets = Context.VersionDiff.AssetDiffInfo.AddAssetDependInfo.GetAssetDetails();
+			const TArray<FAssetDetail>& DiffModifyAssets = Context.VersionDiff.AssetDiffInfo.ModifyAssetDependInfo.GetAssetDetails();
 
-			// 添加显式分块资产（不包含公共资产）
+			TMap<FString, FAssetDetail> DiffAddMap;
+			TMap<FString, FAssetDetail> DiffModifyMap;
+			for (const auto& Asset : DiffAddAssets)
+			{
+				FString LongPackageName = UFlibAssetManageHelper::PackagePathToLongPackageName(Asset.PackagePath.ToString());
+				if (DiffPackageNames.Contains(LongPackageName))
+				{
+					DiffAddMap.Add(LongPackageName, Asset);
+				}
+			}
+			for (const auto& Asset : DiffModifyAssets)
+			{
+				FString LongPackageName = UFlibAssetManageHelper::PackagePathToLongPackageName(Asset.PackagePath.ToString());
+				if (DiffPackageNames.Contains(LongPackageName))
+				{
+					DiffModifyMap.Add(LongPackageName, Asset);
+				}
+			}
+
+			// 添加显式分块资产（不包含公共资产，且仅来自diff）
 			const TSet<FString>& ChunkPkgs = ChunkOwnedPackages.FindRef(Chunk.ChunkName);
 			for (const auto& PkgName : ChunkPkgs)
 			{
-				Desc.AddAssets.AddAssetsDetail(PackageToAssetDetail[PkgName]);	
+				if (DiffAddMap.Contains(PkgName))
+				{
+					Desc.AddAssets.AddAssetsDetail(DiffAddMap[PkgName]);
+				}
+				else if (DiffModifyMap.Contains(PkgName))
+				{
+					Desc.ModifyAssets.AddAssetsDetail(DiffModifyMap[PkgName]);
+				}
 			}
 
-			Desc.Assets = Desc.AddAssets;
+			Desc.Assets = UFlibAssetManageHelper::CombineAssetDependencies(Desc.AddAssets, Desc.ModifyAssets);
 
 			// Collect extern files per-platform (use existing helper)
 			for (auto Platform : AllPlatforms)
@@ -922,15 +960,31 @@ namespace PatchWorker
 		if (CommonDifferencePackages.Num() > 0)
 		{
 			Context.CommonChunkDescribe = FChunkAssetDescribe();
+			const TArray<FAssetDetail>& DiffAddAssets = Context.VersionDiff.AssetDiffInfo.AddAssetDependInfo.GetAssetDetails();
+			const TArray<FAssetDetail>& DiffModifyAssets = Context.VersionDiff.AssetDiffInfo.ModifyAssetDependInfo.GetAssetDetails();
+			TMap<FString, FAssetDetail> DiffAddMap;
+			TMap<FString, FAssetDetail> DiffModifyMap;
+			for (const auto& Asset : DiffAddAssets)
+			{
+				DiffAddMap.Add(UFlibAssetManageHelper::PackagePathToLongPackageName(Asset.PackagePath.ToString()), Asset);
+			}
+			for (const auto& Asset : DiffModifyAssets)
+			{
+				DiffModifyMap.Add(UFlibAssetManageHelper::PackagePathToLongPackageName(Asset.PackagePath.ToString()), Asset);
+			}
 			for (const auto& PkgName : CommonDifferencePackages)
 			{
-				if (PackageToAssetDetail.Contains(PkgName))
+				if (DiffAddMap.Contains(PkgName))
 				{
-					Context.CommonChunkDescribe.AddAssets.AddAssetsDetail(PackageToAssetDetail[PkgName]);
+					Context.CommonChunkDescribe.AddAssets.AddAssetsDetail(DiffAddMap[PkgName]);
+				}
+				else if (DiffModifyMap.Contains(PkgName))
+				{
+					Context.CommonChunkDescribe.ModifyAssets.AddAssetsDetail(DiffModifyMap[PkgName]);
 				}
 			}
 
-			Context.CommonChunkDescribe.Assets = Context.CommonChunkDescribe.AddAssets;
+			Context.CommonChunkDescribe.Assets = UFlibAssetManageHelper::CombineAssetDependencies(Context.CommonChunkDescribe.AddAssets, Context.CommonChunkDescribe.ModifyAssets);
 
 			if (Context.CommonChunkDescribe.HasValidAssets())
 			{
